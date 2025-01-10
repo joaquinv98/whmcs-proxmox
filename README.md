@@ -29,7 +29,7 @@ The module accepts the following customizable options:
 
 # Setup and Configuration
 
-Upon purchasing this module, you will receive all necessary files for setup. This is a one-time payment module designed primarily for Linux deployments, though it can also support Windows with certain limitations.
+Upon purchasing this module, you will receive all necessary files for setup. This module is designed primarily for Linux deployments, though it can also support Windows with certain limitations.
 
 ## Public IP Configuration
 
@@ -62,3 +62,5 @@ The module is completely open source, and you can modify it as you please to bet
 # Contribute
 
 If you want to contribute, please feel free to acquire it via: [WHMCS Marketplace](https://marketplace.whmcs.com/product/7553-proxmox-simple-provisioning)
+
+note: you may need to increase allowed times in both nginx and apache to over 300s depending on your deployment speed.
