@@ -1051,7 +1051,7 @@ function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $no
     $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/config";
 
     // Cloud-Init user and password settings
-    $cloudInitUser     = 'u' . $userId . $params['pid']; // Set username to 'u' + WHMCS user ID
+    $cloudInitUser     = 'u' . $userId . $params['serviceid']; // Set username to 'u' + WHMCS user ID
     $cloudInitPassword = $password;    // Set password to service password
 
     // Prepare network configuration with the assigned MAC address
@@ -1825,7 +1825,7 @@ function proxmox_custom_getVMID($serviceId)
 function proxmox_custom_updateServiceDetails($serviceId, $userId, $publicIP)
 {
     // Set the username to the user ID
-    $username = 'u' . $userId . $params['pid'];
+    $username = 'u' . $userId . $params['serviceid'];
 
     // Replace dots in the public IP with dashes
     $publicIPFormatted = str_replace('.', '-', $publicIP);
