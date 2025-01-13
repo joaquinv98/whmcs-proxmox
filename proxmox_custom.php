@@ -157,7 +157,7 @@ function proxmox_custom_CreateAccount(array $params)
         );
 
         // 4. Create Proxmox user if it doesn't exist
-        $proxmoxUserID = 'u' . $userId . $params['pid'] . '@pve'; // Adjust realm if needed
+        $proxmoxUserID = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
         $userExists    = proxmox_custom_userExists($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID);
         logModuleCall(
             'proxmox_custom',
@@ -411,7 +411,7 @@ function proxmox_custom_SuspendAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID  = 'u' . $userId . $params['pid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID  = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
 
     try {
         // Stop the VM (stop, not shutdown)
@@ -448,7 +448,7 @@ function proxmox_custom_UnsuspendAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID  = 'u' . $userId . $params['pid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID  = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
 
     try {
         // Assign permissions to the user for the VM
@@ -487,7 +487,7 @@ function proxmox_custom_TerminateAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID = 'u' . $userId . $params['pid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
 
     try {
         // Check if VM is running
