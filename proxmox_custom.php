@@ -157,7 +157,7 @@ function proxmox_custom_CreateAccount(array $params)
         );
 
         // 4. Create Proxmox user if it doesn't exist
-        $proxmoxUserID = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
+        $proxmoxUserID = 'client' . $userId . '@pve'; // Adjust realm if needed
         $userExists    = proxmox_custom_userExists($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID);
         logModuleCall(
             'proxmox_custom',
@@ -411,7 +411,7 @@ function proxmox_custom_SuspendAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID  = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID  = 'client' . $userId . '@pve'; // Adjust realm if needed
 
     try {
         // Stop the VM (stop, not shutdown)
@@ -448,7 +448,7 @@ function proxmox_custom_UnsuspendAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID  = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID  = 'client' . $userId . '@pve'; // Adjust realm if needed
 
     try {
         // Assign permissions to the user for the VM
@@ -487,7 +487,7 @@ function proxmox_custom_TerminateAccount(array $params)
 
     // Get WHMCS User ID
     $userId         = $params['userid'];
-    $proxmoxUserID = 'u' . $userId . $params['serviceid'] . '@pve'; // Adjust realm if needed
+    $proxmoxUserID = 'client' . $userId . '@pve'; // Adjust realm if needed
 
     try {
         // Check if VM is running
@@ -1051,7 +1051,7 @@ function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $no
     $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/config";
 
     // Cloud-Init user and password settings
-    $cloudInitUser     = 'u' . $userId . $params['serviceid']; // Set username to 'u' + WHMCS user ID
+    $cloudInitUser     = 'client' . $userId; // Set username to 'client' + WHMCS user ID
     $cloudInitPassword = $password;    // Set password to service password
 
     // Prepare network configuration with the assigned MAC address
@@ -1825,7 +1825,7 @@ function proxmox_custom_getVMID($serviceId)
 function proxmox_custom_updateServiceDetails($serviceId, $userId, $publicIP)
 {
     // Set the username to the user ID
-    $username = 'u' . $userId . $params['serviceid'];
+    $username = 'client' . $userId;
 
     // Replace dots in the public IP with dashes
     $publicIPFormatted = str_replace('.', '-', $publicIP);
