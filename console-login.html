@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head><title>Console Login</title></head>
+<body style="background:#0f0f23;color:#818cf8;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh">
+<p>Opening console&hellip;</p>
+<script>
+// Read ticket and console URL from the hash fragment (not sent to server = secure)
+try {
+    var params = JSON.parse(decodeURIComponent(window.location.hash.substring(1)));
+    // Set the PVEAuthCookie on THIS domain (vps.neatech.ar)
+    document.cookie = "PVEAuthCookie=" + encodeURIComponent(params.ticket) + "; path=/; secure";
+    // Redirect to the Proxmox console
+    window.location.replace(params.url);
+} catch(e) {
+    document.body.innerHTML = '<p style="color:#f87171">Console login failed: ' + e.message + '</p>';
+}
+</script>
+</body>
+</html>
