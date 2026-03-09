@@ -308,10 +308,11 @@ function proxmox_custom_SuspendAccount(array $params)
     $serverHostname = $params['serverhostname'];
     $apiTokenID     = $params['serverusername'];
     $apiTokenSecret = $params['serverpassword'];
-    $node           = $params['configoption2'];
+    $nodeConfigured = $params['configoption2'];
     $roleid = 'PVEVMUser';
 
     $vmid = proxmox_custom_getVMID($serviceId);
+    $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
 
     $userId        = $params['userid'];
     $proxmoxUserID = 'client' . $userId . '@pve';
@@ -336,9 +337,10 @@ function proxmox_custom_UnsuspendAccount(array $params)
     $serverHostname = $params['serverhostname'];
     $apiTokenID     = $params['serverusername'];
     $apiTokenSecret = $params['serverpassword'];
-    $node           = $params['configoption2'];
+    $nodeConfigured = $params['configoption2'];
 
     $vmid = proxmox_custom_getVMID($serviceId);
+    $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
 
     $userId        = $params['userid'];
     $proxmoxUserID = 'client' . $userId . '@pve';
@@ -364,10 +366,11 @@ function proxmox_custom_TerminateAccount(array $params)
     $serverHostname = $params['serverhostname'];
     $apiTokenID     = $params['serverusername'];
     $apiTokenSecret = $params['serverpassword'];
-    $node           = $params['configoption2'];
+    $nodeConfigured = $params['configoption2'];
     $roleid         = 'PVEVMUser';
 
     $vmid = proxmox_custom_getVMID($serviceId);
+    $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
 
     $userId        = $params['userid'];
     $proxmoxUserID = 'client' . $userId . '@pve';
@@ -1853,9 +1856,10 @@ function proxmox_custom_Start(array $params)
         $serverHostname = $params['serverhostname'];
         $apiTokenID     = $params['serverusername'];
         $apiTokenSecret = $params['serverpassword'];
-        $node           = $params['configoption2'];
+        $nodeConfigured = $params['configoption2'];
         $serviceId      = $params['serviceid'];
         $vmid = proxmox_custom_getVMID($serviceId);
+        $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
         proxmox_custom_startVM($serverHostname, $apiTokenID, $apiTokenSecret, $node, $vmid);
         return 'success';
     } catch (Exception $e) {
@@ -1869,9 +1873,10 @@ function proxmox_custom_Stop(array $params)
         $serverHostname = $params['serverhostname'];
         $apiTokenID     = $params['serverusername'];
         $apiTokenSecret = $params['serverpassword'];
-        $node           = $params['configoption2'];
+        $nodeConfigured = $params['configoption2'];
         $serviceId      = $params['serviceid'];
         $vmid = proxmox_custom_getVMID($serviceId);
+        $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
         proxmox_custom_stopVM($serverHostname, $apiTokenID, $apiTokenSecret, $node, $vmid);
         return 'success';
     } catch (Exception $e) {
@@ -1895,9 +1900,10 @@ function proxmox_custom_ClientArea(array $params)
         $serverHostname = $params['serverhostname'];
         $apiTokenID     = $params['serverusername'];
         $apiTokenSecret = $params['serverpassword'];
-        $node           = proxmox_custom_GetOption($params, 'Node');
+        $nodeConfigured = proxmox_custom_GetOption($params, 'Node');
         $serviceId      = $params['serviceid'];
         $vmid           = proxmox_custom_getVMID($serviceId);
+        $node           = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
 
         // Get standard resource usage
         $vmResources = proxmox_custom_getVMResourceUsage($serverHostname, $apiTokenID, $apiTokenSecret, $node, $vmid);
@@ -2053,9 +2059,10 @@ function proxmox_custom_Reboot(array $params)
         $serverHostname = $params['serverhostname'];
         $apiTokenID     = $params['serverusername'];
         $apiTokenSecret = $params['serverpassword'];
-        $node           = $params['configoption2'];
+        $nodeConfigured = $params['configoption2'];
         $serviceId      = $params['serviceid'];
         $vmid = proxmox_custom_getVMID($serviceId);
+        $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
         proxmox_custom_rebootVM($serverHostname, $apiTokenID, $apiTokenSecret, $node, $vmid);
         return 'success';
     } catch (Exception $e) {
@@ -2106,9 +2113,10 @@ function proxmox_custom_Console(array $params)
         $serverHostname = $params['serverhostname'];
         $apiTokenID     = $params['serverusername'];
         $apiTokenSecret = $params['serverpassword'];
-        $node           = $params['configoption2'];
+        $nodeConfigured = $params['configoption2'];
         $serviceId      = $params['serviceid'];
         $vmid           = proxmox_custom_getVMID($serviceId);
+        $node           = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
         $userId         = $params['userid'];
 
         // Build clean console URL (Proxmox JS handles VNC connection internally)
@@ -2319,4 +2327,48 @@ function proxmox_custom_setLastReinstallTime($serviceId, $timestamp)
         $fieldId = $field->id;
     }
     Capsule::table('tblcustomfieldsvalues')->updateOrInsert(['fieldid' => $fieldId, 'relid' => $serviceId], ['value' => $timestamp]);
+}
+/**
+ * Resolve the current node of a VM from the cluster view.
+ * Falls back to the configured node if it cannot be resolved.
+ */
+function proxmox_custom_resolveVMNode($hostname, $apiTokenID, $apiTokenSecret, $vmid, $fallbackNode = null)
+{
+    $url = "https://{$hostname}/api2/json/cluster/resources?type=vm";
+    $headers = ["Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}"];
+
+    try {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_HTTPHEADER     => $headers,
+        ]);
+
+        $response  = curl_exec($ch);
+        $curlError = curl_error($ch);
+        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($response === false) {
+            throw new Exception('Resolve node failed: ' . $curlError);
+        }
+
+        $data = json_decode($response, true);
+        if ($httpCode >= 200 && $httpCode < 300 && isset($data['data'])) {
+            foreach ($data['data'] as $resource) {
+                if (isset($resource['vmid']) && (int)$resource['vmid'] === (int)$vmid && !empty($resource['node'])) {
+                    return $resource['node'];
+                }
+            }
+        } else {
+            throw new Exception('Resolve node failed: Invalid response');
+        }
+    } catch (Exception $e) {
+        // Log but keep going with the fallback node so actions still work.
+        logModuleCall('proxmox_custom', __FUNCTION__, ['vmid' => $vmid, 'fallback' => $fallbackNode], $e->getMessage(), null);
+    }
+
+    return $fallbackNode;
 }
