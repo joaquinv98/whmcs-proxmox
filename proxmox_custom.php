@@ -211,9 +211,12 @@ function proxmox_custom_CreateAccount(array $params)
     try {
         logModuleCall('proxmox_custom', __FUNCTION__, 'Starting account creation (synchronous)', null, null);
 
-        // 1. Generate VMID
-        $newVMID = proxmox_custom_generateNewVMID($serverHostname, $apiTokenID, $apiTokenSecret);
-        logModuleCall('proxmox_custom', __FUNCTION__, 'Generated VMID', ['newVMID' => $newVMID], null);
+        // 1. Use Service ID as VMID — prefix with '9' if under 100 (Proxmox requires VMID >= 100)
+        $newVMID = ($serviceId < 100) ? (int)('9' . $serviceId) : $serviceId;
+        if (proxmox_custom_vmidExists($serverHostname, $apiTokenID, $apiTokenSecret, $newVMID)) {
+            throw new Exception("VMID {$newVMID} (Service ID) already exists in Proxmox. Cannot provision.");
+        }
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Using Service ID as VMID', ['newVMID' => $newVMID], null);
 
         // 2. Clone VM (synchronous — waits for completion)
         proxmox_custom_cloneVM($serverHostname, $apiTokenID, $apiTokenSecret, $node, $templateId, $newVMID, $vmName);
@@ -1019,10 +1022,19 @@ function proxmox_custom_destroyVM($hostname, $apiTokenID, $apiTokenSecret, $node
     }
 }
 
-function proxmox_custom_generateNewVMID($hostname, $apiTokenID, $apiTokenSecret)
+/**
+ * Checks whether a VMID already exists in the Proxmox cluster.
+ *
+ * @param string $hostname
+ * @param string $apiTokenID
+ * @param string $apiTokenSecret
+ * @param int|string $vmid The VMID to check.
+ * @return bool True if the VMID already exists.
+ * @throws Exception on API failure.
+ */
+function proxmox_custom_vmidExists($hostname, $apiTokenID, $apiTokenSecret, $vmid)
 {
-    $url = "https://{$hostname}/api2/json/cluster/nextid";
-
+    $url = "https://{$hostname}/api2/json/cluster/resources?type=vm";
     $headers = ["Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}"];
 
     $ch = curl_init($url);
@@ -1030,24 +1042,31 @@ function proxmox_custom_generateNewVMID($hostname, $apiTokenID, $apiTokenSecret)
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
-        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_HTTPHEADER     => $headers,
     ]);
 
-    $response = curl_exec($ch);
+    $response  = curl_exec($ch);
     $curlError = curl_error($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    logModuleCall('proxmox_custom', 'Generate New VMID', ['URL' => $url,], ['Response' => $response, 'cURL Error' => $curlError,]);
+    logModuleCall('proxmox_custom', __FUNCTION__, ['URL' => $url, 'vmid' => $vmid], ['Response' => $response, 'cURL Error' => $curlError], null);
 
     if ($response === false) {
-        throw new Exception('Get next VMID failed: ' . $curlError);
+        throw new Exception('Check VMID existence failed: ' . $curlError);
     }
 
     $data = json_decode($response, true);
-    if (isset($data['data'])) {
-        return $data['data'];
+    if ($httpCode >= 200 && $httpCode < 300 && isset($data['data'])) {
+        foreach ($data['data'] as $resource) {
+            if (isset($resource['vmid']) && (int)$resource['vmid'] === (int)$vmid) {
+                return true;
+            }
+        }
+        return false;
     } else {
-        throw new Exception('Get next VMID failed: Invalid response');
+        $errorMessage = isset($data['errors']) ? json_encode($data['errors']) : $response;
+        throw new Exception('Check VMID existence failed: ' . $errorMessage);
     }
 }
 
