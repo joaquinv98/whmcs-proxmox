@@ -189,7 +189,7 @@ function proxmox_custom_TestConnection(array $params)
 
 function proxmox_custom_CreateAccount(array $params)
 {
-    // No need to set a long time limit — we return quickly now
+    // No need to set a long time limit - we return quickly now
     $serviceId      = $params['serviceid'];
     $serverId       = $params['serverid'];
     $serverHostname = $params['serverhostname'];
@@ -205,20 +205,25 @@ function proxmox_custom_CreateAccount(array $params)
     $networkSpeed = proxmox_custom_GetOption($params, 'NetworkSpeed', '100');
     $templateId   = proxmox_custom_GetOption($params, 'TemplateID', '101');
 
+    // Optional hints used by reinstall flow to keep the same network identity.
+    $preferredMac       = isset($params['__preferredMac']) ? trim((string) $params['__preferredMac']) : '';
+    $preferredIP        = isset($params['__preferredIP']) ? trim((string) $params['__preferredIP']) : '';
+    $strictPreferredMac = !empty($params['__strictPreferredMac']);
+
     $ramMB = $ramGB * 1024;
     $vmName = 'vm' . $serviceId;
 
     try {
         logModuleCall('proxmox_custom', __FUNCTION__, 'Starting account creation (synchronous)', null, null);
 
-        // 1. Use Service ID as VMID — prefix with '9' if under 100 (Proxmox requires VMID >= 100)
+        // 1. Use Service ID as VMID - prefix with "9" if under 100 (Proxmox requires VMID >= 100)
         $newVMID = ($serviceId < 100) ? (int)('9' . $serviceId) : $serviceId;
         if (proxmox_custom_vmidExists($serverHostname, $apiTokenID, $apiTokenSecret, $newVMID)) {
             throw new Exception("VMID {$newVMID} (Service ID) already exists in Proxmox. Cannot provision.");
         }
         logModuleCall('proxmox_custom', __FUNCTION__, 'Using Service ID as VMID', ['newVMID' => $newVMID], null);
 
-        // 2. Clone VM (synchronous — waits for completion)
+        // 2. Clone VM (synchronous - waits for completion)
         proxmox_custom_cloneVM($serverHostname, $apiTokenID, $apiTokenSecret, $node, $templateId, $newVMID, $vmName);
         logModuleCall('proxmox_custom', __FUNCTION__, 'Clone completed', ['templateId' => $templateId, 'newVMID' => $newVMID], null);
 
@@ -238,7 +243,7 @@ function proxmox_custom_CreateAccount(array $params)
         }
 
         // 5. Create Proxmox user with a random internal password
-        //    (client never sees this — console auto-login handles auth)
+        //    (client never sees this - console auto-login handles auth)
         $proxmoxUserID = 'client' . $userId . '@pve';
         $pvePassword = bin2hex(random_bytes(16));
 
@@ -258,7 +263,17 @@ function proxmox_custom_CreateAccount(array $params)
         logModuleCall('proxmox_custom', __FUNCTION__, 'Assigned Permissions', ['proxmoxUserID' => $proxmoxUserID], null);
 
         // 7. Reserve MAC address, Public IP, Bridge and MTU
-        list($macAddress, $publicIP, $bridge, $mtu) = proxmox_custom_getAvailableMAC($serverId, $serverHostname, $apiTokenID, $apiTokenSecret, $node);
+        list($macAddress, $publicIP, $bridge, $mtu) = proxmox_custom_getAvailableMAC(
+            $serverId,
+            $serverHostname,
+            $apiTokenID,
+            $apiTokenSecret,
+            $node,
+            $preferredMac,
+            $strictPreferredMac,
+            $preferredIP,
+            $serviceId
+        );
         logModuleCall('proxmox_custom', __FUNCTION__, 'Reserved Network Details', ['macAddress' => $macAddress, 'publicIP' => $publicIP, 'bridge' => $bridge, 'mtu' => $mtu], null);
 
         // 8. Save Dedicated IP and service details
@@ -300,7 +315,7 @@ function proxmox_custom_CreateAccount(array $params)
         return 'success';
 
     } catch (Exception $e) {
-        logModuleCall('proxmox_custom', __FUNCTION__, ['serviceid' => $serviceId, 'apiTokenSecret' => '***', 'password' => '***',], $e->getMessage(), $e->getTraceAsString());
+        logModuleCall('proxmox_custom', __FUNCTION__, ['serviceid' => $serviceId, 'apiTokenSecret' => '***', 'password' => '***'], $e->getMessage(), $e->getTraceAsString());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -1375,7 +1390,41 @@ function proxmox_custom_assignPermissions($hostname, $apiTokenID, $apiTokenSecre
     }
 }
 
-function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiTokenSecret, $node)
+function proxmox_custom_getUsedServiceIPs($excludeServiceId = 0)
+{
+    $query = Capsule::table('tblhosting')
+        ->whereNotNull('dedicatedip')
+        ->where('dedicatedip', '!=', '')
+        ->whereNotIn('domainstatus', ['Terminated', 'Cancelled', 'Fraud']);
+
+    if (!empty($excludeServiceId)) {
+        $query->where('id', '!=', (int) $excludeServiceId);
+    }
+
+    $ips = [];
+    foreach ($query->pluck('dedicatedip') as $ip) {
+        $normalized = strtolower(trim((string) $ip));
+        if ($normalized !== '') {
+            $ips[] = $normalized;
+        }
+    }
+
+    return array_values(array_unique($ips));
+}
+
+function proxmox_custom_reserveServiceIP($serviceId, $publicIP)
+{
+    $publicIP = trim((string) $publicIP);
+    if ($publicIP === '') {
+        return;
+    }
+
+    Capsule::table('tblhosting')
+        ->where('id', (int) $serviceId)
+        ->update(['dedicatedip' => $publicIP]);
+}
+
+function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiTokenSecret, $node, $preferredMac = '', $strictPreferredMac = false, $preferredIP = '', $serviceId = 0)
 {
     logModuleCall('proxmox_custom', __FUNCTION__, 'Fetching Assigned IP Addresses from server configuration', ['serverId' => $serverId], null);
 
@@ -1389,30 +1438,33 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
         throw new Exception('No MAC addresses configured in the "Assigned IP Addresses" field.');
     }
 
+    $preferredMac = strtolower(trim((string) $preferredMac));
+    $preferredIP = trim((string) $preferredIP);
+
     $macPool = [];
     $lines = explode("\n", $assignedIPsRaw);
     foreach ($lines as $line) {
         $line = trim($line);
-        if (empty($line)) continue;
-        
+        if (empty($line)) {
+            continue;
+        }
+
         // Parse MAC=IP or MAC=IP;Bridge or MAC=IP;Bridge,MTU
         if (strpos($line, '=') !== false) {
             list($mac, $configData) = explode('=', $line, 2);
             $mac = trim($mac);
             $configData = trim($configData);
-            
+
             // Set defaults
             $ip = $configData;
-            $bridge = 'vmbr1'; // Default backup bridge
+            $bridge = 'vmbr1';
             $mtu = null;
 
-            // Check if bridge info is present (delimited by ;)
             if (strpos($configData, ';') !== false) {
                 list($ip, $bridgeData) = explode(';', $configData, 2);
                 $ip = trim($ip);
                 $bridgeData = trim($bridgeData);
 
-                // Check if MTU info is present (delimited by , inside bridgeData)
                 if (strpos($bridgeData, ',') !== false) {
                     list($bridge, $mtuVal) = explode(',', $bridgeData, 2);
                     $bridge = trim($bridge);
@@ -1421,19 +1473,17 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
                     $bridge = $bridgeData;
                 }
             }
-            
-            // Store structured data instead of just IP
+
             $macPool[$mac] = [
                 'ip' => $ip,
                 'bridge' => $bridge,
-                'mtu' => $mtu
+                'mtu' => $mtu,
             ];
         } else {
-            // Fallback for lines without '=' (though unlikely based on your format)
             $macPool[$line] = [
                 'ip' => '',
                 'bridge' => 'vmbr1',
-                'mtu' => null
+                'mtu' => null,
             ];
         }
     }
@@ -1443,19 +1493,76 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
     }
     logModuleCall('proxmox_custom', __FUNCTION__, 'Parsed MAC-IP Pool', ['macPool' => $macPool], null);
 
+    // Cluster-wide MAC usage check to avoid duplicates on different nodes.
     $usedMacs = proxmox_custom_getUsedMACs($hostname, $apiTokenID, $apiTokenSecret, $node);
+    $usedMacLookup = array_flip(array_map('strtolower', $usedMacs));
+    $usedIPs = proxmox_custom_getUsedServiceIPs((int) $serviceId);
+    $usedIPLookup = array_flip($usedIPs);
     logModuleCall('proxmox_custom', __FUNCTION__, 'Retrieved Used MAC Addresses', ['usedMacs' => $usedMacs], null);
+    logModuleCall('proxmox_custom', __FUNCTION__, 'Retrieved Used Service IPs', ['usedIPs' => $usedIPs], null);
+
+    if ($preferredMac !== '') {
+        $preferredPoolMac = '';
+        foreach (array_keys($macPool) as $poolMac) {
+            if (strtolower($poolMac) === $preferredMac) {
+                $preferredPoolMac = $poolMac;
+                break;
+            }
+        }
+
+        if ($preferredPoolMac !== '') {
+            if (!isset($usedMacLookup[$preferredMac])) {
+                $details = $macPool[$preferredPoolMac];
+                if (empty($details['ip']) && $preferredIP !== '') {
+                    $details['ip'] = $preferredIP;
+                }
+                $candidateIP = strtolower(trim((string) $details['ip']));
+                if ($candidateIP !== '' && isset($usedIPLookup[$candidateIP])) {
+                    if ($strictPreferredMac) {
+                        throw new Exception("Preferred IP {$details['ip']} is already assigned to another service.");
+                    }
+                } else {
+                    if (!empty($serviceId) && $candidateIP !== '') {
+                        proxmox_custom_reserveServiceIP($serviceId, $details['ip']);
+                    }
+
+                    logModuleCall('proxmox_custom', __FUNCTION__, 'Using preferred MAC address', [
+                        'macAddress' => $preferredPoolMac,
+                        'publicIP' => $details['ip'],
+                        'bridge' => $details['bridge'],
+                        'mtu' => $details['mtu'],
+                    ], null);
+
+                    return [$preferredPoolMac, $details['ip'], $details['bridge'], $details['mtu']];
+                }
+            }
+
+            if ($strictPreferredMac) {
+                throw new Exception("Preferred MAC {$preferredPoolMac} is already in use on the cluster.");
+            }
+        } elseif ($strictPreferredMac) {
+            throw new Exception("Preferred MAC {$preferredMac} is not present in the assigned MAC pool.");
+        }
+    }
 
     foreach ($macPool as $mac => $details) {
-        if (!in_array(strtolower($mac), array_map('strtolower', $usedMacs))) {
-            logModuleCall('proxmox_custom', __FUNCTION__, 'Found Available MAC Address', [
-                'macAddress' => $mac, 
+        if (!isset($usedMacLookup[strtolower($mac)])) {
+            $candidateIP = strtolower(trim((string) $details['ip']));
+            if ($candidateIP !== '' && isset($usedIPLookup[$candidateIP])) {
+                continue;
+            }
+
+            if (!empty($serviceId) && $candidateIP !== '') {
+                proxmox_custom_reserveServiceIP($serviceId, $details['ip']);
+            }
+
+            logModuleCall('proxmox_custom', __FUNCTION__, 'Found available MAC address', [
+                'macAddress' => $mac,
                 'publicIP' => $details['ip'],
                 'bridge' => $details['bridge'],
-                'mtu' => $details['mtu']
+                'mtu' => $details['mtu'],
             ], null);
-            
-            // Return array with all details
+
             return [$mac, $details['ip'], $details['bridge'], $details['mtu']];
         }
     }
@@ -1463,7 +1570,116 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
     throw new Exception('No available MAC addresses in the pool.');
 }
 
+function proxmox_custom_extractMACFromNetValue($value)
+{
+    if (preg_match('/hwaddr=([0-9A-Fa-f:]+)/i', $value, $matches)) {
+        return strtolower($matches[1]);
+    }
+    if (preg_match('/macaddr=([0-9A-Fa-f:]+)/i', $value, $matches)) {
+        return strtolower($matches[1]);
+    }
+    if (preg_match('/^(?:virtio|e1000|rtl8139|vmxnet3)=([0-9A-Fa-f:]+)/i', $value, $matches)) {
+        return strtolower($matches[1]);
+    }
+    if (preg_match('/^([0-9A-Fa-f:]{17})/', $value, $matches)) {
+        return strtolower($matches[1]);
+    }
+
+    return null;
+}
+
+function proxmox_custom_extractPrimaryMAC(array $vmConfig)
+{
+    $netKeys = [];
+    foreach ($vmConfig as $key => $value) {
+        if (preg_match('/^net\d+$/', $key)) {
+            $netKeys[] = $key;
+        }
+    }
+
+    if (empty($netKeys)) {
+        return null;
+    }
+
+    natsort($netKeys);
+    foreach ($netKeys as $key) {
+        $mac = proxmox_custom_extractMACFromNetValue($vmConfig[$key]);
+        if ($mac !== null) {
+            return $mac;
+        }
+    }
+
+    return null;
+}
+
 function proxmox_custom_getUsedMACs($hostname, $apiTokenID, $apiTokenSecret, $node)
+{
+    $url = "https://{$hostname}/api2/json/cluster/resources?type=vm";
+    $headers = ["Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}"];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+
+    $response  = curl_exec($ch);
+    $curlError = curl_error($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    logModuleCall('proxmox_custom', __FUNCTION__, 'Get cluster VM list response', ['URL' => $url], ['httpCode' => $httpCode, 'Response' => $response, 'cURL Error' => $curlError]);
+
+    if ($response === false || $httpCode < 200 || $httpCode >= 300) {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Cluster VM list unavailable, falling back to node scan', ['node' => $node, 'httpCode' => $httpCode], ['response' => $response, 'curlError' => $curlError]);
+        return proxmox_custom_getUsedMACsOnNode($hostname, $apiTokenID, $apiTokenSecret, $node);
+    }
+
+    $data = json_decode($response, true);
+    if (!isset($data['data']) || !is_array($data['data'])) {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Invalid cluster VM list response, falling back to node scan', ['node' => $node], $response);
+        return proxmox_custom_getUsedMACsOnNode($hostname, $apiTokenID, $apiTokenSecret, $node);
+    }
+
+    $usedMacs = [];
+    foreach ($data['data'] as $resource) {
+        if (!isset($resource['type']) || $resource['type'] !== 'qemu') {
+            continue;
+        }
+        if (empty($resource['node']) || !isset($resource['vmid'])) {
+            continue;
+        }
+
+        $resourceNode = $resource['node'];
+        $vmid = $resource['vmid'];
+
+        try {
+            $vmConfig = proxmox_custom_getVMConfig($hostname, $apiTokenID, $apiTokenSecret, $resourceNode, $vmid);
+        } catch (Exception $e) {
+            logModuleCall('proxmox_custom', __FUNCTION__, "Failed to get config for VMID {$vmid} on node {$resourceNode}", null, $e->getMessage());
+            continue;
+        }
+
+        foreach ($vmConfig as $key => $value) {
+            if (!preg_match('/^net\d+$/', $key)) {
+                continue;
+            }
+
+            $mac = proxmox_custom_extractMACFromNetValue($value);
+            if ($mac !== null) {
+                $usedMacs[] = $mac;
+            }
+        }
+    }
+
+    $usedMacs = array_values(array_unique($usedMacs));
+    logModuleCall('proxmox_custom', __FUNCTION__, 'Retrieved used MAC addresses', null, ['usedMacs' => $usedMacs]);
+    return $usedMacs;
+}
+
+function proxmox_custom_getUsedMACsOnNode($hostname, $apiTokenID, $apiTokenSecret, $node)
 {
     $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu";
     $headers = ["Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}"];
@@ -1479,19 +1695,25 @@ function proxmox_custom_getUsedMACs($hostname, $apiTokenID, $apiTokenSecret, $no
     $response  = curl_exec($ch);
     $curlError = curl_error($ch);
     curl_close($ch);
-    logModuleCall('proxmox_custom', __FUNCTION__, 'Get VM List Response', ['URL' => $url, 'Headers' => $headers,], ['Response' => $response, 'cURL Error' => $curlError,]);
+
+    logModuleCall('proxmox_custom', __FUNCTION__, 'Get node VM list response', ['URL' => $url], ['Response' => $response, 'cURL Error' => $curlError]);
 
     if ($response === false) {
-        throw new Exception('Failed to retrieve VM list: ' . $curlError);
+        throw new Exception('Failed to retrieve node VM list: ' . $curlError);
     }
+
     $data = json_decode($response, true);
     if (!isset($data['data']) || !is_array($data['data'])) {
-        throw new Exception('Invalid response when retrieving VM list.');
+        throw new Exception('Invalid response when retrieving node VM list.');
     }
 
     $usedMacs = [];
     foreach ($data['data'] as $vm) {
+        if (!isset($vm['vmid'])) {
+            continue;
+        }
         $vmid = $vm['vmid'];
+
         try {
             $vmConfig = proxmox_custom_getVMConfig($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid);
         } catch (Exception $e) {
@@ -1500,22 +1722,19 @@ function proxmox_custom_getUsedMACs($hostname, $apiTokenID, $apiTokenSecret, $no
         }
 
         foreach ($vmConfig as $key => $value) {
-            if (preg_match('/^net\d+/', $key)) {
-                if (preg_match('/hwaddr=([0-9A-Fa-f:]+)/i', $value, $matches)) {
-                    $usedMacs[] = strtolower($matches[1]);
-                } elseif (preg_match('/macaddr=([0-9A-Fa-f:]+)/i', $value, $matches)) {
-                    $usedMacs[] = strtolower($matches[1]);
-                } elseif (preg_match('/^(?:virtio|e1000|rtl8139|vmxnet3)=([0-9A-Fa-f:]+)/i', $value, $matches)) {
-                    $usedMacs[] = strtolower($matches[1]);
-                } elseif (preg_match('/^([0-9A-Fa-f:]{17})/', $value, $matches)) {
-                    $usedMacs[] = strtolower($matches[1]);
-                }
+            if (!preg_match('/^net\d+$/', $key)) {
+                continue;
+            }
+
+            $mac = proxmox_custom_extractMACFromNetValue($value);
+            if ($mac !== null) {
+                $usedMacs[] = $mac;
             }
         }
     }
 
-    $usedMacs = array_unique($usedMacs);
-    logModuleCall('proxmox_custom', __FUNCTION__, 'Retrieved Used MAC Addresses', null, ['usedMacs' => $usedMacs]);
+    $usedMacs = array_values(array_unique($usedMacs));
+    logModuleCall('proxmox_custom', __FUNCTION__, 'Retrieved used node MAC addresses', null, ['usedMacs' => $usedMacs]);
     return $usedMacs;
 }
 
@@ -1863,11 +2082,90 @@ function proxmox_custom_AdminCustomButtonArray()
         "Start VM" => "Start",
         "Stop VM"  => "Stop",
         "Reboot VM" => "Reboot",
+        "Fix Permissions" => "FixPermissions",
     ];
 }
 
 
 // --- CLIENT AREA FUNCTIONS --- //
+
+function proxmox_custom_FixPermissions(array $params)
+{
+    try {
+        $serviceId      = (int) $params['serviceid'];
+        $serverHostname = $params['serverhostname'];
+        $apiTokenID     = $params['serverusername'];
+        $apiTokenSecret = $params['serverpassword'];
+        $nodeConfigured = $params['configoption2'];
+        $userId         = $params['userid'];
+        $proxmoxUserID  = 'client' . $userId . '@pve';
+        $roleid         = 'PVEVMUser';
+
+        $vmid = proxmox_custom_getVMID($serviceId);
+        $node = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
+        $path = "/vms/{$vmid}";
+
+        $hosting = Capsule::table('tblhosting')->where('id', $serviceId)->first(['domainstatus']);
+        $serviceStatus = $hosting
+            ? strtolower(trim((string) $hosting->domainstatus))
+            : strtolower(trim((string) ($params['domainstatus'] ?? ($params['status'] ?? ''))));
+
+        if ($serviceStatus === 'suspended') {
+            try {
+                proxmox_custom_removePermissions($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID, $path, $roleid);
+            } catch (Exception $e) {
+                // If ACL entry is already missing, treat it as already fixed.
+                if (!preg_match('/not\\s+found|does\\s+not\\s+exist|no\\s+such/i', $e->getMessage())) {
+                    throw $e;
+                }
+            }
+
+            logModuleCall('proxmox_custom', __FUNCTION__, [
+                'serviceId' => $serviceId,
+                'vmid' => $vmid,
+                'node' => $node,
+                'status' => $serviceStatus,
+                'action' => 'remove_acl',
+            ], null, null);
+            return 'success';
+        }
+
+        if ($serviceStatus === 'active') {
+            $userExists = proxmox_custom_userExists($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID);
+            if (!$userExists) {
+                $pvePassword = proxmox_custom_getPVEPassword($serviceId);
+                if (empty($pvePassword)) {
+                    $pvePassword = bin2hex(random_bytes(16));
+                    proxmox_custom_savePVEPassword($serviceId, $pvePassword);
+                }
+
+                proxmox_custom_createUser($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID, $pvePassword);
+            }
+
+            try {
+                proxmox_custom_removePermissions($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID, $path, $roleid);
+            } catch (Exception $e) {
+                // Non-fatal for reapply path; assignment below is authoritative.
+                logModuleCall('proxmox_custom', __FUNCTION__, 'Pre-clean ACL remove failed (continuing)', $e->getMessage(), null);
+            }
+
+            proxmox_custom_assignPermissions($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID, $path, $roleid);
+            logModuleCall('proxmox_custom', __FUNCTION__, [
+                'serviceId' => $serviceId,
+                'vmid' => $vmid,
+                'node' => $node,
+                'status' => $serviceStatus,
+                'action' => 'reapply_acl',
+            ], null, null);
+            return 'success';
+        }
+
+        return "Error: Service status '{$serviceStatus}' is not supported. Use Active or Suspended.";
+    } catch (Exception $e) {
+        logModuleCall('proxmox_custom', __FUNCTION__, ['serviceid' => $params['serviceid']], $e->getMessage(), $e->getTraceAsString());
+        return 'Error: ' . $e->getMessage();
+    }
+}
 
 function proxmox_custom_Start(array $params)
 {
@@ -2297,7 +2595,6 @@ function proxmox_custom_Reinstall(array $params)
 {
     try {
         $serviceId = $params['serviceid'];
-        $userId    = $params['userid'];
         $currentTime = time();
         $lastReinstallTime = proxmox_custom_getLastReinstallTime($serviceId);
 
@@ -2307,14 +2604,42 @@ function proxmox_custom_Reinstall(array $params)
             throw new Exception("You must wait {$minutes} more minute(s) before you can reinstall the server.");
         }
 
+        // Snapshot current MAC/IP so reinstall can preserve network identity.
+        $serverHostname = $params['serverhostname'];
+        $apiTokenID     = $params['serverusername'];
+        $apiTokenSecret = $params['serverpassword'];
+        $nodeConfigured = $params['configoption2'];
+        $vmid           = proxmox_custom_getVMID($serviceId);
+        $resolvedNode   = proxmox_custom_resolveVMNode($serverHostname, $apiTokenID, $apiTokenSecret, $vmid, $nodeConfigured);
+
+        $vmConfig = proxmox_custom_getVMConfig($serverHostname, $apiTokenID, $apiTokenSecret, $resolvedNode, $vmid);
+        $preferredMac = proxmox_custom_extractPrimaryMAC($vmConfig);
+        if (empty($preferredMac)) {
+            throw new Exception('Unable to detect the current VM MAC address. Reinstall aborted to avoid changing IP assignment.');
+        }
+
+        $preferredIP = proxmox_custom_getPublicIP($serviceId);
+        if ($preferredIP === 'Unknown') {
+            $preferredIP = '';
+        }
+
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Captured current network identity for reinstall', ['serviceId' => $serviceId, 'preferredMac' => $preferredMac, 'preferredIP' => $preferredIP], null);
+
         $terminateResult = proxmox_custom_TerminateAccount($params);
         if ($terminateResult !== 'success') {
             throw new Exception('Failed to terminate the existing VM: ' . $terminateResult);
         }
-        $createResult = proxmox_custom_CreateAccount($params);
+
+        $createParams = $params;
+        $createParams['__preferredMac'] = $preferredMac;
+        $createParams['__preferredIP'] = $preferredIP;
+        $createParams['__strictPreferredMac'] = true;
+
+        $createResult = proxmox_custom_CreateAccount($createParams);
         if ($createResult !== 'success') {
             throw new Exception('Failed to create the new VM: ' . $createResult);
         }
+
         proxmox_custom_setLastReinstallTime($serviceId, $currentTime);
         return 'success';
 
