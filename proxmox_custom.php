@@ -91,6 +91,16 @@ function proxmox_custom_ConfigOptions()
             'Default' => '.vps.example.com',
             'Description' => 'Hostname suffix for VMs, e.g. .vps.example.com',
         ],
+        // OJO: proxmox_custom_GetOption() resuelve cada opcion por su POSICION en este
+        // array (configoption1, configoption2, ...). Las opciones nuevas van al FINAL;
+        // insertarlas en el medio corre a todas las siguientes y rompe los productos ya
+        // configurados.
+        'IsolationGroupPrefix' => [
+            'Type' => 'text',
+            'Size' => '20',
+            'Default' => '',
+            'Description' => 'Optional. Prefix of the cluster.fw security group applied to each VM, as &lt;prefix&gt;&lt;bridge&gt; (e.g. "vps-" + "vlan10" = group "vps-vlan10"). The group must already exist in cluster.fw. Leave empty to skip network isolation.',
+        ],
     ];
 }
 
@@ -204,6 +214,7 @@ function proxmox_custom_CreateAccount(array $params)
     $diskSizeGB   = proxmox_custom_GetOption($params, 'DiskSize', 20);
     $networkSpeed = proxmox_custom_GetOption($params, 'NetworkSpeed', '100');
     $templateId   = proxmox_custom_GetOption($params, 'TemplateID', '101');
+    $isolationGroupPrefix = proxmox_custom_GetOption($params, 'IsolationGroupPrefix', '');
 
     // Optional hints used by reinstall flow to keep the same network identity.
     $preferredMac       = isset($params['__preferredMac']) ? trim((string) $params['__preferredMac']) : '';
@@ -262,8 +273,8 @@ function proxmox_custom_CreateAccount(array $params)
         proxmox_custom_assignPermissions($serverHostname, $apiTokenID, $apiTokenSecret, $proxmoxUserID, $path, $roleid);
         logModuleCall('proxmox_custom', __FUNCTION__, 'Assigned Permissions', ['proxmoxUserID' => $proxmoxUserID], null);
 
-        // 7. Reserve MAC address, Public IP, Bridge and MTU
-        list($macAddress, $publicIP, $bridge, $mtu) = proxmox_custom_getAvailableMAC(
+        // 7. Reserve MAC address, Public IP, Bridge, MTU and Private IP
+        list($macAddress, $publicIP, $bridge, $mtu, $privateIP) = proxmox_custom_getAvailableMAC(
             $serverId,
             $serverHostname,
             $apiTokenID,
@@ -274,7 +285,7 @@ function proxmox_custom_CreateAccount(array $params)
             $preferredIP,
             $serviceId
         );
-        logModuleCall('proxmox_custom', __FUNCTION__, 'Reserved Network Details', ['macAddress' => $macAddress, 'publicIP' => $publicIP, 'bridge' => $bridge, 'mtu' => $mtu], null);
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Reserved Network Details', ['macAddress' => $macAddress, 'publicIP' => $publicIP, 'bridge' => $bridge, 'mtu' => $mtu, 'privateIP' => $privateIP], null);
 
         // 8. Save Dedicated IP and service details
         $hostnameSuffix = proxmox_custom_GetOption($params, 'HostnameSuffix', '.vps.example.com');
@@ -300,7 +311,7 @@ function proxmox_custom_CreateAccount(array $params)
         proxmox_custom_configureVM(
             $serverHostname, $apiTokenID, $apiTokenSecret, $node, $newVMID,
             $cpuCores, $ramMB, $userId, $password,
-            $macAddress, $bridge, $mtu
+            $macAddress, $bridge, $mtu, $privateIP, $isolationGroupPrefix
         );
         logModuleCall('proxmox_custom', __FUNCTION__, 'VM configured', ['vmid' => $newVMID], null);
 
@@ -594,10 +605,13 @@ function proxmox_custom_continueProvisioning()
                     }
 
                     // Configure VM
+                    // privateIP: hoy nada inserta en mod_proxmox_tasks, asi que esta rama
+                    // no corre. Si se reactiva, el pool tiene que traer el cuarto campo o
+                    // el VPS nace sin ipfilter (el ?? null hace que simplemente se omita).
                     proxmox_custom_configureVM(
                         $hostname, $apiTokenID, $apiTokenSecret, $node, $vmid,
                         $p['cpuCores'], $p['ramMB'], $p['userid'], $p['password'],
-                        $p['macAddress'], $p['bridge'], $p['mtu']
+                        $p['macAddress'], $p['bridge'], $p['mtu'], $p['privateIP'] ?? null
                     );
                     logModuleCall('proxmox_custom', __FUNCTION__, "VM configured for task {$task->id}", null, null);
 
@@ -1130,7 +1144,7 @@ function proxmox_custom_cloneVM($hostname, $apiTokenID, $apiTokenSecret, $node, 
 }
 
 // Function to configure VM
-function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $cpuCores, $ram, $userId, $password, $macAddress, $bridge = 'vmbr1', $mtu = null)
+function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $cpuCores, $ram, $userId, $password, $macAddress, $bridge = 'vmbr1', $mtu = null, $privateIP = null, $isolationGroupPrefix = '')
 {
     $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/config";
     
@@ -1138,7 +1152,12 @@ function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $no
     $cloudInitPassword = $password;
     
     // Updated NetConfig logic to support custom bridge and optional MTU
-    $netConfig = "virtio={$macAddress},bridge={$bridge},firewall=0";
+    // firewall=1 activa el firewall por NIC de Proxmox. Junto con las opciones que
+    // escribe proxmox_custom_configureVMFirewall() al final de esta funcion, eso da
+    // macfilter (una sola MAC por adapter, mata bridges internos del guest).
+    // OJO: sin ese .fw con policy_in=ACCEPT el VPS queda inalcanzable, porque la
+    // politica por defecto de Proxmox es DROP.
+    $netConfig = "virtio={$macAddress},bridge={$bridge},firewall=1";
     if ($mtu) {
         $netConfig .= ",mtu={$mtu}";
     }
@@ -1185,6 +1204,285 @@ function proxmox_custom_configureVM($hostname, $apiTokenID, $apiTokenSecret, $no
     }
 
     logModuleCall('proxmox_custom', __FUNCTION__, 'Configure VM Success', ['vmid' => $vmid, 'status' => 'Configurations applied successfully'], null);
+
+    // Anti-spoofing. No es opcional: net0 ya sale con firewall=1 y sin estas opciones
+    // Proxmox aplica su politica por defecto (policy_in DROP) y el VPS nace sin
+    // conectividad entrante.
+    //
+    // ORDEN CRITICO: el ipset tiene que existir Y tener la IP antes de prender ipfilter.
+    // Con ipfilter=1 y el ipset vacio, Proxmox dropea TODO el saliente del VPS. Por eso
+    // si el ipset falla se deja ipfilter=0: un VPS que puede spoofear es un problema,
+    // uno sin red es un reembolso.
+    $ipfilter = 0;
+    if (!empty($privateIP)) {
+        try {
+            if (proxmox_custom_configureVMIPFilter($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $privateIP)) {
+                $ipfilter = 1;
+            }
+        } catch (Exception $e) {
+            logModuleCall('proxmox_custom', __FUNCTION__, 'ipset fallo, se deja ipfilter=0', $e->getMessage(), null);
+        }
+    } else {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Sin IP privada en el pool: el VPS queda sin ipfilter', ['vmid' => $vmid, 'mac' => $macAddress, 'bridge' => $bridge], null);
+    }
+
+    // Un try por llamada: si falla el firewall no queremos perder tambien el aislamiento,
+    // que es independiente. Antes compartian un solo try y se caian los dos juntos.
+    try {
+        proxmox_custom_configureVMFirewall($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $ipfilter);
+    } catch (Exception $e) {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'VM firewall options failed (non-fatal)', $e->getMessage(), null);
+    }
+
+    try {
+        proxmox_custom_configureVMIsolation($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $bridge, $isolationGroupPrefix);
+    } catch (Exception $e) {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'VM isolation failed (non-fatal)', $e->getMessage(), null);
+    }
+
+    return true;
+}
+
+/**
+ * Aisla al VPS del resto de la red interna: bloquea todo destino RFC1918 salvo el
+ * gateway de su propia VLAN y el DNS. Las IPs publicas NO se tocan, caen en el
+ * catch-all de policy_out ACCEPT, asi que el outbound normal del cliente sigue igual.
+ *
+ * Por que aca y no con "bridge link set isolated on": ese flag es LOCAL AL HOST, asi
+ * que dos clientes en nodos distintos se siguen viendo por el trunk. Una regla en el
+ * firewall de la VM aplica siempre, migre donde migre, y ademas cubre el acceso a la
+ * infraestructura propia (gestion, overlays WireGuard).
+ *
+ * El ruleset vive en cluster.fw como security group, uno por bridge/VLAN, y aca solo
+ * se agrega la referencia al grupo: cambiar el aislamiento se hace en un solo lugar en
+ * vez de en cada VPS. El nombre sale de la opcion IsolationGroupPrefix del producto,
+ * concatenada con el bridge (prefijo "vps-" + bridge "vlan10" = grupo "vps-vlan10").
+ * Vacia = sin aislamiento, que es el default para no asumir la red de nadie.
+ *
+ * Al armar el grupo, tener en cuenta que un DROP de todo RFC1918 tiene que incluir
+ * 10.0.0.0/8 si ahi viven tuneles (WireGuard y demas), y dejar como excepcion el
+ * gateway de la VLAN y el resolver DNS, o el VPS queda sin red utilizable.
+ */
+function proxmox_custom_configureVMIsolation($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $bridge, $groupPrefix = '')
+{
+    // Sin prefijo no hay aislamiento: es opcional y depende de que el operador haya
+    // creado los security groups en cluster.fw.
+    $groupPrefix = trim((string) $groupPrefix);
+    if ($groupPrefix === '') {
+        logModuleCall('proxmox_custom', __FUNCTION__, 'Aislamiento omitido: IsolationGroupPrefix vacio', ['vmid' => $vmid, 'bridge' => $bridge], null);
+        return false;
+    }
+
+    // Si el grupo no existe en cluster.fw la API lo rechaza y el llamador lo registra
+    // como no-fatal, asi que no hace falta mantener aca una lista de bridges validos.
+    $grupo = $groupPrefix . $bridge;
+
+    $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/firewall/rules";
+    $headers = [
+        "Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}",
+        'Content-Type: application/x-www-form-urlencoded',
+    ];
+
+    $postFields = http_build_query([
+        'type'   => 'group',
+        'action' => $grupo,
+        'enable' => 1,
+    ], '', '&', PHP_QUERY_RFC3986);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $postFields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $response  = curl_exec($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($response === false) {
+        throw new Exception('Configure VM isolation failed: ' . $curlError);
+    }
+    // Sin este chequeo, un 401/403 cuyo cuerpo no traiga la clave 'errors' devuelve
+    // true y el alta sale 'success' con el VPS sin aislar y sin rastro en el log.
+    if ($httpCode < 200 || $httpCode >= 300) {
+        throw new Exception("Configure VM isolation failed: HTTP {$httpCode} " . $response);
+    }
+    $data = json_decode($response, true);
+    if (isset($data['errors']) && !empty($data['errors'])) {
+        throw new Exception('Configure VM isolation failed: ' . json_encode($data['errors']));
+    }
+
+    logModuleCall('proxmox_custom', __FUNCTION__, 'VM isolation group applied', ['vmid' => $vmid, 'bridge' => $bridge, 'group' => $grupo], null);
+    return true;
+}
+
+/**
+ * Crea el ipset ipfilter-net0 de la VM con su IP privada. Eso es lo que habilita en
+ * Proxmox el anti-spoofing de IP de origen Y el de ARP: la regla
+ * "-p ARP --arp-ip-src <ip> -j RETURN / -j DROP" de la cadena tap<vmid>i0-OUT-ARP sale
+ * de este ipset, NO del macfilter. El macfilter es solo "-s ! <mac> -j DROP".
+ *
+ * La IP privada no la inventa el modulo: viene del cuarto campo del pool assignedips,
+ * que refleja la reserva DHCP de esa MAC.
+ *
+ * ATENCION: el que llama solo debe prender ipfilter si esto devolvio true. Con
+ * ipfilter=1 y el ipset vacio, Proxmox dropea TODO el trafico saliente del VPS.
+ */
+function proxmox_custom_configureVMIPFilter($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $privateIP, $nic = 'net0')
+{
+    if (!filter_var($privateIP, FILTER_VALIDATE_IP)) {
+        throw new Exception("IP privada invalida para el ipfilter: '{$privateIP}'");
+    }
+
+    $ipset   = "ipfilter-{$nic}";
+    $base    = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/firewall/ipset";
+    $headers = [
+        "Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}",
+        'Content-Type: application/x-www-form-urlencoded',
+    ];
+
+    // 1. crear el ipset. Si ya existe (reinstall sobre el mismo VMID) no es un error.
+    $ch = curl_init($base);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query(['name' => $ipset], '', '&', PHP_QUERY_RFC3986),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    if ($response === false) {
+        throw new Exception("No se pudo crear el ipset {$ipset}: " . $curlError);
+    }
+    if (($httpCode < 200 || $httpCode >= 300) && stripos((string) $response, 'already exists') === false) {
+        throw new Exception("No se pudo crear el ipset {$ipset}: HTTP {$httpCode} " . $response);
+    }
+
+    // 2. cargarle la IP privada
+    $ch = curl_init("{$base}/{$ipset}");
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => http_build_query(['cidr' => $privateIP], '', '&', PHP_QUERY_RFC3986),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    if ($response === false) {
+        throw new Exception("No se pudo agregar {$privateIP} al ipset {$ipset}: " . $curlError);
+    }
+    if (($httpCode < 200 || $httpCode >= 300) && stripos((string) $response, 'already exists') === false) {
+        throw new Exception("No se pudo agregar {$privateIP} al ipset {$ipset}: HTTP {$httpCode} " . $response);
+    }
+
+    // 3. releer y confirmar. Es el unico paso que realmente prueba que quedo, y de el
+    //    depende que sea seguro prender ipfilter.
+    $ch = curl_init("{$base}/{$ipset}");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $encontrada = false;
+    if ($response !== false && $httpCode >= 200 && $httpCode < 300) {
+        $data = json_decode($response, true);
+        if (isset($data['data']) && is_array($data['data'])) {
+            foreach ($data['data'] as $entrada) {
+                if (isset($entrada['cidr']) && trim($entrada['cidr']) === $privateIP) {
+                    $encontrada = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!$encontrada) {
+        throw new Exception("El ipset {$ipset} quedo sin {$privateIP}: NO prender ipfilter");
+    }
+
+    logModuleCall('proxmox_custom', __FUNCTION__, 'ipset listo', ['vmid' => $vmid, 'ipset' => $ipset, 'cidr' => $privateIP], null);
+    return true;
+}
+
+/**
+ * Configura el firewall por VM de Proxmox con anti-spoofing de capa 2.
+ *
+ * macfilter descarta toda trama cuya MAC de origen no sea la asignada a la NIC:
+ * eso es "una MAC por adapter" y ademas inutiliza cualquier bridge interno que el
+ * cliente arme dentro del guest, obligandolo a NATear detras de su unica identidad.
+ *
+ * ipfilter llega como parametro y filtra por IP de ORIGEN (y por ARP). Solo puede
+ * venir en 1 si el que llama ya creo y VERIFICO el ipset ipfilter-net0 con la IP
+ * privada: con ipfilter=1 y el ipset vacio, Proxmox dropea todo el saliente del VPS.
+ * La IP privada sale del cuarto campo del pool assignedips (la reserva DHCP), asi
+ * que el alta ya no depende de scripts/aplicar-antispoof-desde-kea.ps1.
+ *
+ * policy_in / policy_out en ACCEPT hacen que habilitar el firewall no cambie el
+ * comportamiento de red del VPS. Lo unico que dropea es el anti-spoofing.
+ */
+function proxmox_custom_configureVMFirewall($hostname, $apiTokenID, $apiTokenSecret, $node, $vmid, $ipfilter = 0)
+{
+    $url = "https://{$hostname}/api2/json/nodes/{$node}/qemu/{$vmid}/firewall/options";
+
+    $postFields = http_build_query([
+        'enable'     => 1,
+        'policy_in'  => 'ACCEPT',
+        'policy_out' => 'ACCEPT',
+        'macfilter'  => 1,
+        'ipfilter'   => $ipfilter ? 1 : 0,
+        'ndp'        => 1,
+        'radv'       => 0,
+    ], '', '&', PHP_QUERY_RFC3986);
+
+    $headers = [
+        "Authorization: PVEAPIToken={$apiTokenID}={$apiTokenSecret}",
+        'Content-Type: application/x-www-form-urlencoded',
+    ];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => 'PUT',
+        CURLOPT_POSTFIELDS     => $postFields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_HTTPHEADER     => $headers,
+    ]);
+
+    $response  = curl_exec($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+    logModuleCall('proxmox_custom', __FUNCTION__, 'VM firewall options', ['vmid' => $vmid, 'ipfilter' => $ipfilter ? 1 : 0, 'HTTP Code' => $httpCode, 'Response' => $response, 'cURL Error' => $curlError], null);
+
+    if ($response === false) {
+        throw new Exception('Configure VM firewall failed: ' . $curlError);
+    }
+    if ($httpCode < 200 || $httpCode >= 300) {
+        throw new Exception("Configure VM firewall failed: HTTP {$httpCode} " . $response);
+    }
+
+    $data = json_decode($response, true);
+    if (isset($data['errors']) && !empty($data['errors'])) {
+        throw new Exception('Configure VM firewall failed: ' . json_encode($data['errors']));
+    }
+
     return true;
 }
 
@@ -1449,7 +1747,11 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
             continue;
         }
 
-        // Parse MAC=IP or MAC=IP;Bridge or MAC=IP;Bridge,MTU
+        // Parse MAC=IP | MAC=IP;Bridge | MAC=IP;Bridge,MTU | MAC=IP;Bridge,MTU,PrivateIP
+        //
+        // El cuarto campo es la IP PRIVADA que el DHCP le tiene reservada a esa MAC.
+        // Con eso el alta puede armar el ipset ipfilter-net0 y dejar el anti-spoofing
+        // por IP aplicado sin depender de ningun reconciliador externo.
         if (strpos($line, '=') !== false) {
             list($mac, $configData) = explode('=', $line, 2);
             $mac = trim($mac);
@@ -1459,6 +1761,7 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
             $ip = $configData;
             $bridge = 'vmbr1';
             $mtu = null;
+            $privateIP = null;
 
             if (strpos($configData, ';') !== false) {
                 list($ip, $bridgeData) = explode(';', $configData, 2);
@@ -1466,24 +1769,32 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
                 $bridgeData = trim($bridgeData);
 
                 if (strpos($bridgeData, ',') !== false) {
-                    list($bridge, $mtuVal) = explode(',', $bridgeData, 2);
-                    $bridge = trim($bridge);
-                    $mtu = intval(trim($mtuVal));
+                    $partes = explode(',', $bridgeData, 3);
+                    $bridge = trim($partes[0]);
+                    $mtu    = intval(trim($partes[1]));
+
+                    // Se valida aca: un typo en el pool que llegue al ipset deja al
+                    // VPS sin red. Si no es una IP valida, se ignora y queda sin ipfilter.
+                    if (isset($partes[2]) && filter_var(trim($partes[2]), FILTER_VALIDATE_IP)) {
+                        $privateIP = trim($partes[2]);
+                    }
                 } else {
                     $bridge = $bridgeData;
                 }
             }
 
             $macPool[$mac] = [
-                'ip' => $ip,
-                'bridge' => $bridge,
-                'mtu' => $mtu,
+                'ip'        => $ip,
+                'bridge'    => $bridge,
+                'mtu'       => $mtu,
+                'privateIP' => $privateIP,
             ];
         } else {
             $macPool[$line] = [
-                'ip' => '',
-                'bridge' => 'vmbr1',
-                'mtu' => null,
+                'ip'        => '',
+                'bridge'    => 'vmbr1',
+                'mtu'       => null,
+                'privateIP' => null,
             ];
         }
     }
@@ -1531,9 +1842,10 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
                         'publicIP' => $details['ip'],
                         'bridge' => $details['bridge'],
                         'mtu' => $details['mtu'],
+                        'privateIP' => $details['privateIP'],
                     ], null);
 
-                    return [$preferredPoolMac, $details['ip'], $details['bridge'], $details['mtu']];
+                    return [$preferredPoolMac, $details['ip'], $details['bridge'], $details['mtu'], $details['privateIP']];
                 }
             }
 
@@ -1561,9 +1873,10 @@ function proxmox_custom_getAvailableMAC($serverId, $hostname, $apiTokenID, $apiT
                 'publicIP' => $details['ip'],
                 'bridge' => $details['bridge'],
                 'mtu' => $details['mtu'],
+                'privateIP' => $details['privateIP'],
             ], null);
 
-            return [$mac, $details['ip'], $details['bridge'], $details['mtu']];
+            return [$mac, $details['ip'], $details['bridge'], $details['mtu'], $details['privateIP']];
         }
     }
 

@@ -81,6 +81,7 @@ In your WHMCS product settings, configure these options:
 | **Node**           | Proxmox node name (e.g. `pve001`)                                    |
 | **HostnameSuffix** | Domain suffix for VM hostnames (e.g. `.vps.example.com`)             |
 | **EnableConsole**  | Show VNC console button in client area (`on` / `off`)                |
+| **IsolationGroupPrefix** | Optional. Prefix of the `cluster.fw` security group applied to each VM, as `<prefix><bridge>`. Empty = no isolation |
 
 ---
 
@@ -91,19 +92,36 @@ Define a pool of available MAC addresses, public IPs, network bridges, and MTUs 
 In the **Assigned IP Addresses** field, enter one configuration per line using the following format:
 
 ```
-[MAC Address]=[Public IP];[Bridge],[MTU]
+[MAC Address]=[Public IP];[Bridge],[MTU],[Private IP]
 ```
+
+Only the MAC and public IP are required. Bridge, MTU and private IP are optional, in that order.
 
 **Examples:**
 
 ```
-bc:24:11:23:0e:c2=181.13.218.180;vmbr2,1250
-52:54:00:a6:6e:5b=200.89.174.82;vmbr2,1250
+bc:24:11:00:00:01=198.51.100.10;vmbr2,1250,10.0.0.10
+bc:24:11:00:00:02=198.51.100.11;vmbr2,1250,10.0.0.11
+bc:24:11:00:00:03=198.51.100.12;vmbr2
 ```
 
 ### How it works
 
 The module assigns IPs to VMs using DHCP with static mapping (configured to deny unknown clients). The IP is not forcefully configured inside the server OS by the module; instead, the DHCP server assigns the correct IP based on the MAC address provisioned in Proxmox.
+
+### The private IP field (anti-spoofing)
+
+The fourth field is the **private IP that your DHCP server has reserved for that MAC**. When present, provisioning creates the VM's `ipfilter-net0` ipset with that address and enables `ipfilter`, so Proxmox drops any packet or ARP reply the VM sends from an address that is not its own. Together with `macfilter` (always on), a customer with root inside the VM cannot take over a neighbour's address.
+
+Order matters and the module enforces it: the ipset is created, loaded and **read back to confirm** before `ipfilter` is turned on. If any of those steps fails, `ipfilter` stays off and the reason is written to the Module Log — a VM that can spoof is a problem, but a VM with no network at all is worse.
+
+Lines without a fourth field keep working exactly as before: they simply get no `ipfilter`.
+
+### Optional network isolation
+
+Set **IsolationGroupPrefix** on the product to have every new VM reference a Proxmox security group named `<prefix><bridge>` — for example prefix `vps-` with bridge `vlan10` applies the group `vps-vlan10`. Create those groups in `cluster.fw` first; the module only adds the reference, so you can change the isolation rules for every VM in one place.
+
+Leave it empty (the default) to skip isolation entirely.
 
 ---
 
